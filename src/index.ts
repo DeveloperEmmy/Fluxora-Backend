@@ -10,7 +10,6 @@
  */
 
 import http from 'node:http';
-import { createApp } from './app.js';
 import { gracefulShutdown, addShutdownHook } from './shutdown.js';
 import { logger } from './lib/logger.js';
 import { checkPendingMigrations } from './db/migrate.js';
@@ -20,17 +19,19 @@ import { createStreamHub, getStreamHub } from './ws/hub.js';
 // Export a pre-built app instance for use in tests and other consumers.
 export { app } from './app.js';
 
-// Configuration
-const PORT = parseInt(process.env.PORT || '3000', 10);
 const NODE_ENV = process.env.NODE_ENV || 'development';
 
 async function startServer() {
   try {
+    const { initializeConfig } = await import('./config/env.js');
+    const config = initializeConfig();
+
     // Guard: fail fast if any migrations are pending.
     // Migrations must be applied (e.g. via `pnpm migrate`) before starting.
     await checkPendingMigrations();
 
-    const app = createApp();
+    const { createApp } = await import('./app.js');
+    const app = createApp({ config });
     const server = http.createServer(app);
 
     // Initialize WebSocket hub (registered on the HTTP server as a side effect)
@@ -74,15 +75,19 @@ async function startServer() {
     });
 
     // Start listening
-    server.listen(PORT, () => {
+    server.listen(config.port, () => {
       logger.info('Fluxora API listening', undefined, { 
-        port: PORT, 
+        port: config.port,
         nodeEnv: NODE_ENV,
         pid: process.pid 
       });
     });
 
   } catch (err) {
+    if (err instanceof Error && err.name === 'EnvironmentError') {
+      console.error(err.message);
+    }
+
     logger.error('Failed to start Fluxora API', undefined, {
       error: err instanceof Error ? err.message : 'Unknown error',
     });
