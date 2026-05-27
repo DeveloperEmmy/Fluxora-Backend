@@ -57,6 +57,13 @@ async function startServer() {
     });
 
     addShutdownHook(async () => {
+      logger.info('Closing rate-limiter store...');
+      const limiter = app.locals.rateLimiter as import('./middleware/rateLimiter.js').RateLimiter | undefined;
+      if (limiter) await limiter.close();
+      logger.info('Rate-limiter store closed');
+    });
+
+    addShutdownHook(async () => {
       logger.info('Closing database connections...');
       const pool = getPool();
       await pool.end();
