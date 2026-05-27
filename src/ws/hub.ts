@@ -30,6 +30,7 @@
  */
 
 import { randomUUID } from 'node:crypto';
+import { EventEmitter } from 'node:events';
 import { WebSocket, WebSocketServer } from 'ws';
 import type { IncomingMessage, IncomingHttpHeaders } from 'http';
 import type { Server } from 'http';
@@ -42,6 +43,12 @@ import { getTracer } from '../tracing/hooks.js';
 import { getCorrelationId } from '../tracing/middleware.js';
 import { logger } from '../lib/logger.js';
 import { CORRELATION_ID_HEADER, isValidCorrelationId } from '../middleware/correlationId.js';
+import {
+  isValidStellarPublicKey,
+  parseHandshakeSubscriptionFilter,
+  parseWsClientMessage,
+  type SubscriptionFilter,
+} from './messageHandler.js';
 
 // ── Constants ─────────────────────────────────────────────────────────────────
 
@@ -60,12 +67,25 @@ export interface StreamUpdateEvent {
   eventId: string;
   payload: unknown;
   ledger?: number;
+  recipientAddress?: string;
 }
 
 export interface BackpressureMetrics {
   droppedMessages: number;
   terminatedConnections: number;
   sentMessages: number;
+}
+
+export type BackpressureAction = 'drop' | 'terminate';
+
+export interface StreamHubBackpressureEvent {
+  action: BackpressureAction;
+  streamId: string;
+  eventId: string;
+  connectionId: string;
+  bufferedAmount: number;
+  thresholdBytes: number;
+  timestamp: string;
 }
 
 interface ConnectionMetrics {
@@ -80,8 +100,9 @@ interface ClientState {
   connectedAt: number;
   ip: string;
   correlationId?: string;
+  authenticatedSubject?: string;
   metrics: ConnectionMetrics;
-  subscriptions: Set<string>;
+  subscriptionFilters: Map<string, SubscriptionFilter>;
   messageTimestamps: number[];
 }
 
@@ -108,10 +129,11 @@ export interface StreamHubOptions {
 
 // ── Hub ───────────────────────────────────────────────────────────────────────
 
-export class StreamHub {
+export class StreamHub extends EventEmitter {
   private readonly wss: WebSocketServer;
   private readonly clients = new Map<WebSocket, ClientState>();
-  private readonly subscriptions = new Map<string, Set<WebSocket>>();
+  private readonly streamSubscriptions = new Map<string, Set<WebSocket>>();
+  private readonly recipientSubscriptions = new Map<string, Set<WebSocket>>();
   private readonly dedup: IDedupCache;
   private readonly ownsDedup: boolean;
   private readonly wsAuthRequired: boolean;
@@ -128,6 +150,8 @@ export class StreamHub {
   private terminateBytes: number = BACKPRESSURE_TERMINATE_BYTES;
 
   constructor(server: Server, options?: StreamHubOptions) {
+    super();
+
     if (options?.dedupCache) {
       this.dedup = options.dedupCache;
       this.ownsDedup = false;
@@ -187,17 +211,21 @@ export class StreamHub {
     const ip = req.socket.remoteAddress ?? 'unknown';
     const connectedAt = Date.now();
     const correlationId = this.extractCorrelationId(req.headers);
+    const authenticatedSubject = this.extractAuthenticatedSubject(req);
 
     const state: ClientState = {
       id: connectionId,
       connectedAt,
       ip,
       metrics: { messagesReceived: 0, messagesSent: 0, bytesReceived: 0, bytesSent: 0 },
-      subscriptions: new Set(),
+      subscriptionFilters: new Map(),
       messageTimestamps: [],
     };
     if (correlationId !== undefined) {
       state.correlationId = correlationId;
+    }
+    if (authenticatedSubject !== undefined) {
+      state.authenticatedSubject = authenticatedSubject;
     }
     this.clients.set(ws, state);
 
@@ -207,6 +235,8 @@ export class StreamHub {
       ip,
       timestamp: new Date(connectedAt).toISOString(),
     });
+
+    this.applyHandshakeSubscription(ws, req);
 
     ws.on('message', (data, isBinary) => {
       const state = this.clients.get(ws);
@@ -245,11 +275,8 @@ export class StreamHub {
     const state = this.clients.get(ws);
     if (!state) return;
 
-    for (const streamId of state.subscriptions) {
-      this.subscriptions.get(streamId)?.delete(ws);
-      if (this.subscriptions.get(streamId)?.size === 0) {
-        this.subscriptions.delete(streamId);
-      }
+    for (const filter of state.subscriptionFilters.values()) {
+      this.removeSubscriptionFromIndexes(ws, filter);
     }
 
     const durationMs = Date.now() - state.connectedAt;
@@ -284,63 +311,144 @@ export class StreamHub {
   // ── Message handling ───────────────────────────────────────────────────────
 
   private handleMessage(ws: WebSocket, raw: string): void {
-    let msg: unknown;
+    let parsed: unknown;
     try {
-      msg = JSON.parse(raw);
+      parsed = JSON.parse(raw);
     } catch {
       this.sendError(ws, 'INVALID_JSON', 'Message is not valid JSON');
       return;
     }
 
-    if (typeof msg !== 'object' || msg === null) {
-      this.sendError(ws, 'INVALID_MESSAGE', 'Message must be a JSON object');
+    const result = parseWsClientMessage(parsed);
+    if (!result.ok) {
+      this.sendError(ws, result.code, result.message);
       return;
     }
 
-    const { type, streamId } = msg as Record<string, unknown>;
-
-    if (type === 'replay') {
-      const { afterEventId, fromLedger, toledger, contractId, topic, limit } = msg as Record<string, unknown>;
-      const replayFilter: StreamEventReplayFilter = {
-        ...(typeof afterEventId === 'string' ? { afterEventId } : {}),
-        ...(typeof fromLedger === 'number' ? { fromLedger } : {}),
-        ...(typeof toledger === 'number' ? { toledger } : {}),
-        ...(typeof contractId === 'string' ? { contractId } : {}),
-        ...(typeof topic === 'string' ? { topic } : {}),
-        ...(typeof limit === 'number' ? { limit } : {}),
-      };
-      void this.replayFromCursor(ws, replayFilter);
+    if (result.message.type === 'replay') {
+      void this.replayFromCursor(ws, result.message.filter);
       return;
     }
 
-    if (typeof streamId !== 'string' || streamId.trim() === '') {
-      this.sendError(ws, 'INVALID_MESSAGE', 'streamId must be a non-empty string');
+    const authorized = this.authorizeSubscriptionFilter(ws, result.message.filter);
+    if (!authorized.ok) {
+      this.sendError(ws, authorized.code, authorized.message);
       return;
     }
 
-    if (type === 'subscribe') {
-      this.subscribe(ws, streamId);
-    } else if (type === 'unsubscribe') {
-      this.unsubscribe(ws, streamId);
+    if (result.message.type === 'subscribe') {
+      this.subscribe(ws, authorized.filter);
     } else {
-      this.sendError(ws, 'UNKNOWN_TYPE', `Unknown message type: ${String(type)}`);
+      this.unsubscribe(ws, authorized.filter);
     }
   }
 
-  private subscribe(ws: WebSocket, streamId: string): void {
+  private subscribe(ws: WebSocket, filter: SubscriptionFilter): void {
     const state = this.clients.get(ws);
     if (!state) return;
-    state.subscriptions.add(streamId);
-    if (!this.subscriptions.has(streamId)) this.subscriptions.set(streamId, new Set());
-    this.subscriptions.get(streamId)!.add(ws);
+
+    const key = this.subscriptionKey(filter);
+    if (state.subscriptionFilters.has(key)) return;
+
+    state.subscriptionFilters.set(key, filter);
+    this.addSubscriptionToIndexes(ws, filter);
   }
 
-  private unsubscribe(ws: WebSocket, streamId: string): void {
+  private unsubscribe(ws: WebSocket, filter: SubscriptionFilter): void {
     const state = this.clients.get(ws);
     if (!state) return;
-    state.subscriptions.delete(streamId);
-    this.subscriptions.get(streamId)?.delete(ws);
-    if (this.subscriptions.get(streamId)?.size === 0) this.subscriptions.delete(streamId);
+
+    const key = this.subscriptionKey(filter);
+    const existing = state.subscriptionFilters.get(key);
+    if (!existing) return;
+
+    state.subscriptionFilters.delete(key);
+    this.removeSubscriptionFromIndexes(ws, existing);
+  }
+
+  private authorizeSubscriptionFilter(
+    ws: WebSocket,
+    filter: SubscriptionFilter,
+  ): { ok: true; filter: SubscriptionFilter } | { ok: false; code: string; message: string } {
+    const state = this.clients.get(ws);
+    if (!state) {
+      return { ok: false, code: 'UNAUTHORIZED', message: 'WebSocket client is not registered' };
+    }
+
+    if (filter.streamId !== undefined) {
+      return { ok: true, filter };
+    }
+
+    const authenticatedRecipient = this.authenticatedRecipientSubject(state);
+
+    if (filter.recipientAddress !== undefined) {
+      if (authenticatedRecipient === undefined) {
+        return {
+          ok: false,
+          code: 'UNAUTHORIZED',
+          message: 'recipient_address subscriptions require an authenticated Stellar public key subject',
+        };
+      }
+
+      if (filter.recipientAddress !== authenticatedRecipient) {
+        return {
+          ok: false,
+          code: 'FORBIDDEN',
+          message: 'recipient_address subscriptions must match the authenticated subject',
+        };
+      }
+      return { ok: true, filter };
+    }
+
+    if (authenticatedRecipient === undefined) {
+      return {
+        ok: false,
+        code: 'UNAUTHORIZED',
+        message: 'empty subscription filters require an authenticated Stellar public key subject',
+      };
+    }
+
+    return { ok: true, filter: { recipientAddress: authenticatedRecipient } };
+  }
+
+  private subscriptionKey(filter: SubscriptionFilter): string {
+    if (filter.streamId !== undefined) return `stream:${filter.streamId}`;
+    if (filter.recipientAddress !== undefined) return `recipient:${filter.recipientAddress}`;
+    return 'recipient:';
+  }
+
+  private addSubscriptionToIndexes(ws: WebSocket, filter: SubscriptionFilter): void {
+    if (filter.streamId !== undefined) {
+      if (!this.streamSubscriptions.has(filter.streamId)) {
+        this.streamSubscriptions.set(filter.streamId, new Set());
+      }
+      this.streamSubscriptions.get(filter.streamId)!.add(ws);
+      return;
+    }
+
+    if (filter.recipientAddress !== undefined) {
+      if (!this.recipientSubscriptions.has(filter.recipientAddress)) {
+        this.recipientSubscriptions.set(filter.recipientAddress, new Set());
+      }
+      this.recipientSubscriptions.get(filter.recipientAddress)!.add(ws);
+    }
+  }
+
+  private removeSubscriptionFromIndexes(ws: WebSocket, filter: SubscriptionFilter): void {
+    if (filter.streamId !== undefined) {
+      this.streamSubscriptions.get(filter.streamId)?.delete(ws);
+      if (this.streamSubscriptions.get(filter.streamId)?.size === 0) {
+        this.streamSubscriptions.delete(filter.streamId);
+      }
+      return;
+    }
+
+    if (filter.recipientAddress !== undefined) {
+      this.recipientSubscriptions.get(filter.recipientAddress)?.delete(ws);
+      if (this.recipientSubscriptions.get(filter.recipientAddress)?.size === 0) {
+        this.recipientSubscriptions.delete(filter.recipientAddress);
+      }
+    }
   }
 
   // ── Broadcast ──────────────────────────────────────────────────────────────
@@ -351,8 +459,8 @@ export class StreamHub {
     if (await this.dedup.has(streamId, eventId)) return;
     await this.dedup.add(streamId, eventId);
 
-    const subscribers = this.subscriptions.get(streamId);
-    if (!subscribers || subscribers.size === 0) return;
+    const subscribers = this.matchingSubscribers(event);
+    if (subscribers.size === 0) return;
 
     const correlationId = getCorrelationId();
     const message = JSON.stringify({ type: 'stream_update', streamId, eventId, payload, correlationId });
@@ -374,6 +482,24 @@ export class StreamHub {
     next();
   }
 
+  private matchingSubscribers(event: StreamUpdateEvent): Set<WebSocket> {
+    const targets = new Set<WebSocket>();
+    const streamMatches = this.streamSubscriptions.get(event.streamId);
+    if (streamMatches) {
+      for (const ws of streamMatches) targets.add(ws);
+    }
+
+    const recipientAddress = this.extractRecipientAddress(event);
+    if (recipientAddress !== undefined) {
+      const recipientMatches = this.recipientSubscriptions.get(recipientAddress);
+      if (recipientMatches) {
+        for (const ws of recipientMatches) targets.add(ws);
+      }
+    }
+
+    return targets;
+  }
+
   private deliverBatch(batch: WebSocket[], message: string, streamId: string, eventId: string): number {
     let sent = 0;
     
@@ -385,6 +511,7 @@ export class StreamHub {
       if (buffered > this.terminateBytes) {
         this.metrics.terminatedConnections++;
         this.metrics.droppedMessages++;
+        this.emitBackpressure(ws, 'terminate', buffered, this.terminateBytes, streamId, eventId);
         try { ws.terminate(); } catch { /* ignore */ }
         this.onDisconnect(ws);
         continue;
@@ -392,6 +519,7 @@ export class StreamHub {
 
       if (buffered > this.dropBytes) {
         this.metrics.droppedMessages++;
+        this.emitBackpressure(ws, 'drop', buffered, this.dropBytes, streamId, eventId);
         continue;
       }
 
@@ -425,7 +553,67 @@ export class StreamHub {
     return sent;
   }
 
+  private emitBackpressure(
+    ws: WebSocket,
+    action: BackpressureAction,
+    bufferedAmount: number,
+    thresholdBytes: number,
+    streamId: string,
+    eventId: string,
+  ): void {
+    const state = this.clients.get(ws);
+    if (!state) return;
+
+    const event: StreamHubBackpressureEvent = {
+      action,
+      streamId,
+      eventId,
+      connectionId: state.id,
+      bufferedAmount,
+      thresholdBytes,
+      timestamp: new Date().toISOString(),
+    };
+
+    this.emit('backpressure', event);
+    logger.warn('WebSocket backpressure applied', state.correlationId, {
+      event: 'ws_backpressure',
+      ...event,
+    });
+  }
+
   // ── Helpers ────────────────────────────────────────────────────────────────
+
+  private extractAuthenticatedSubject(req: IncomingMessage): string | undefined {
+    const result = verifyWsToken(req, this.jwtSecret);
+    if (!result.ok) return undefined;
+
+    const subject = result.payload.sub?.trim();
+    return subject ? subject : undefined;
+  }
+
+  private authenticatedRecipientSubject(state: ClientState): string | undefined {
+    const subject = state.authenticatedSubject;
+    if (subject === undefined || !isValidStellarPublicKey(subject)) return undefined;
+    return subject;
+  }
+
+  private applyHandshakeSubscription(ws: WebSocket, req: IncomingMessage): void {
+    const result = parseHandshakeSubscriptionFilter(req.url ?? '/');
+    if (!result.ok) {
+      this.sendError(ws, 'INVALID_MESSAGE', result.message);
+      return;
+    }
+
+    if (result.filter === null) return;
+
+    const authorized = this.authorizeSubscriptionFilter(ws, result.filter);
+    if (!authorized.ok) {
+      this.sendError(ws, authorized.code, authorized.message);
+      return;
+    }
+
+    this.subscribe(ws, authorized.filter);
+  }
 
   private extractCorrelationId(headers: IncomingHttpHeaders): string | undefined {
     const incoming = headers[CORRELATION_ID_HEADER];
@@ -436,6 +624,26 @@ export class StreamHub {
       }
     }
     return undefined;
+  }
+
+  private extractRecipientAddress(event: StreamUpdateEvent): string | undefined {
+    if (event.recipientAddress !== undefined && event.recipientAddress.trim() !== '') {
+      return event.recipientAddress.trim();
+    }
+
+    const payload = event.payload;
+    if (typeof payload !== 'object' || payload === null || Array.isArray(payload)) {
+      return undefined;
+    }
+
+    const candidate = (payload as Record<string, unknown>)['recipient_address']
+      ?? (payload as Record<string, unknown>)['recipientAddress']
+      ?? (payload as Record<string, unknown>)['recipient'];
+
+    if (typeof candidate !== 'string') return undefined;
+
+    const trimmed = candidate.trim();
+    return trimmed.length > 0 ? trimmed : undefined;
   }
 
   private sendError(ws: WebSocket, code: string, message: string): void {
