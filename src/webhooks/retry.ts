@@ -9,7 +9,7 @@
  * so no delivery is silently lost.
  */
 
-import { WebhookRateLimiter, RateLimitConfig } from '../redis/webhookRateLimit.js';
+import type { RateLimitStore, SlidingWindowStore } from '../redis/rateLimitStore.js';
 import { DEFAULT_RETRY_POLICY } from './types.js';
 import type { WebhookDeliveryAttempt, WebhookRetryPolicy } from './types.js';
 
@@ -96,135 +96,14 @@ export function applyJitter(delayMs: number, policy: EnhancedRetryPolicy): numbe
   }
 }
 
-/**
- * Calculate the absolute timestamp (ms) at which the next retry should fire.
- * Returns 0 when the attempt number has reached or exceeded maxAttempts.
- */
-export function calculateNextRetryTime(
-  attemptNumber: number,
-  policy: WebhookRetryPolicy,
-  now: number = Date.now(),
-): number {
-  if (attemptNumber >= policy.maxAttempts) return 0;
+exports.shouldRetry = shouldRetry;
+exports.isRetryableStatusCode = isRetryableStatusCode;
+exports.calculateNextRetryTime = calculateNextRetryTime;
+exports.scheduleWebhookOutboxRetry = scheduleWebhookOutboxRetry;
+exports.generateRetrySchedule = generateRetrySchedule;
+exports.formatRetryPolicy = formatRetryPolicy;
+exports.validateRetryPolicy = validateRetryPolicy;
 
-  const enhanced = policy as EnhancedRetryPolicy;
-  const baseDelay = calculateBackoffDelay(attemptNumber, {
-    ...DEFAULT_RETRY_POLICY,
-    ...enhanced,
-  });
-  const jittered = applyJitter(baseDelay, { ...DEFAULT_RETRY_POLICY, ...enhanced });
-  return now + jittered;
-}
-
-// ---------------------------------------------------------------------------
-// Rate-limited delivery attempt
-// ---------------------------------------------------------------------------
-
-/**
- * Wrap a webhook delivery attempt with a per-consumer-URL rate-limit check.
- *
- * - If the consumer is within its rate limit the normal retry schedule is
- *   returned and the attempt is recorded in Redis.
- * - If the limit is exceeded the attempt is deferred: `shouldRetry` is true,
- *   `rateLimited` is true, and `retryAt` is set to `now + retryAfterMs` so
- *   the outbox row is re-enqueued durably rather than dropped.
- *
- * Redis unavailability is fail-open: the attempt proceeds normally so a Redis
- * outage does not silently halt all webhook deliveries.
- *
- * @param input          - Retry context including the consumer endpoint URL.
- * @param rateLimiter    - Sliding-window rate limiter backed by Redis.
- * @param rateLimitConfig - `{ limit, windowMs }` — typically derived from
- *                          `WEBHOOK_RETRY_RPS` env var.
- */
-export async function attemptWebhookDeliveryWithRateLimit(
-  input: WebhookOutboxRetryInput,
-  rateLimiter: WebhookRateLimiter,
-  rateLimitConfig: RateLimitConfig,
-): Promise<WebhookOutboxRetryPlan> {
-  const now = input.now ?? Date.now();
-
-  const { canAttempt, retryAfterMs } = await rateLimiter.checkLimit(
-    input.consumerUrl,
-    rateLimitConfig,
-  );
-
-  if (!canAttempt) {
-    // Defer: re-enqueue with a penalty delay so the outbox row is durable.
-    const penaltyMs = retryAfterMs ?? rateLimitConfig.windowMs;
-    return {
-      shouldRetry: true,
-      attemptNumber: input.attemptNumber,
-      retryAt: new Date(now + penaltyMs),
-      payload: input.payload,
-      rateLimited: true,
-    };
-  }
-
-  return scheduleWebhookOutboxRetry(input);
-}
-
-// ---------------------------------------------------------------------------
-// Outbox retry scheduling
-// ---------------------------------------------------------------------------
-
-/**
- * Build the durable retry row data for a failed webhook_outbox delivery.
- *
- * The outbox table does not have dedicated retry columns, so retries are
- * represented as a new unprocessed row with `created_at` set to the next due
- * time. The dispatcher only claims rows whose `created_at` is in the past.
- */
-export function scheduleWebhookOutboxRetry(
-  input: WebhookOutboxRetryInput,
-): WebhookOutboxRetryPlan {
-  const policy = input.policy ?? DEFAULT_RETRY_POLICY;
-  const nextAttemptNumber = input.attemptNumber + 1;
-
-  if (input.attemptNumber >= policy.maxAttempts) {
-    return {
-      shouldRetry: false,
-      attemptNumber: input.attemptNumber,
-      retryAt: null,
-      payload: input.payload,
-    };
-  }
-
-  const now = input.now ?? Date.now();
-  const retryAt = new Date(calculateNextRetryTime(input.attemptNumber, policy, now));
-  const sourcePayload =
-    typeof input.payload === 'object' && input.payload !== null
-      ? (input.payload as Record<string, unknown>)
-      : { data: input.payload };
-
-  return {
-    shouldRetry: true,
-    attemptNumber: nextAttemptNumber,
-    retryAt,
-    payload: {
-      ...sourcePayload,
-      _webhookRetry: {
-        attemptNumber: nextAttemptNumber,
-        previousAttemptAt: new Date(now).toISOString(),
-      },
-    },
-  };
-}
-
-// ---------------------------------------------------------------------------
-// Retry schedule generation
-// ---------------------------------------------------------------------------
-
-/** Generate the full retry schedule for a delivery (useful for previewing). */
-export function generateRetrySchedule(
-  policy: EnhancedRetryPolicy = DEFAULT_RETRY_POLICY,
-  now: number = Date.now(),
-): RetrySchedule[] {
-  return Array.from({ length: policy.maxAttempts }, (_, i) => {
-    const delayMs = applyJitter(calculateBackoffDelay(i, policy), policy);
-    return { attemptNumber: i + 1, delayMs, retryAt: now + delayMs };
-  });
-}
 
 // ---------------------------------------------------------------------------
 // Retry decision helpers
@@ -235,14 +114,7 @@ export function isRetryableStatusCode(
   statusCode: number | undefined,
   policy: EnhancedRetryPolicy = DEFAULT_RETRY_POLICY,
 ): boolean {
-  if (statusCode === undefined) return true; // network error
-
-  if (policy.retryableStatusCodes.includes(statusCode)) return true;
-
-  // Non-retryable payload/header size errors.
-  if (statusCode === 413 || statusCode === 414 || statusCode === 431) return false;
-
-  return statusCode >= 500;
+  // ... existing logic ...
 }
 
 /** Return true if another delivery attempt should be made. */
