@@ -1,4 +1,4 @@
-import { Counter, Histogram, Gauge } from 'prom-client';
+import { Counter, Gauge } from 'prom-client';
 import { registry } from '../metrics.js';
 
 /**
@@ -25,43 +25,38 @@ export const dbSlowQueriesTotal =
     registers: [registry],
   });
 
-/** Gauge: active (checked-out) pool connections. */
 export const dbPoolActiveConnections =
   (registry.getSingleMetric('fluxora_db_pool_active_connections') as Gauge) ||
   new Gauge({
     name: 'fluxora_db_pool_active_connections',
-    help: 'Number of active (checked-out) PostgreSQL pool connections',
+    help: 'Number of active (checked-out) pool connections',
     registers: [registry],
   });
 
-/** Gauge: idle pool connections. */
 export const dbPoolIdleConnections =
   (registry.getSingleMetric('fluxora_db_pool_idle_connections') as Gauge) ||
   new Gauge({
     name: 'fluxora_db_pool_idle_connections',
-    help: 'Number of idle PostgreSQL pool connections',
+    help: 'Number of idle pool connections',
     registers: [registry],
   });
 
-/** Gauge: requests waiting for a pool connection. */
 export const dbPoolWaitingRequests =
   (registry.getSingleMetric('fluxora_db_pool_waiting_requests') as Gauge) ||
   new Gauge({
     name: 'fluxora_db_pool_waiting_requests',
-    help: 'Number of requests waiting for a PostgreSQL pool connection',
+    help: 'Number of requests waiting for a pool connection',
     registers: [registry],
   });
 
-/** Counter incremented each time the pool queue limit is exceeded. */
 export const dbPoolExhaustedTotal =
   (registry.getSingleMetric('fluxora_db_pool_exhausted_total') as Counter) ||
   new Counter({
     name: 'fluxora_db_pool_exhausted_total',
-    help: 'Total number of times the PostgreSQL connection pool was exhausted',
+    help: 'Total number of times the pool queue limit was exceeded',
     registers: [registry],
   });
 
-/** Remove all DB metrics from the registry (used between test runs). */
 export function deRegisterDbMetrics(): void {
   registry.removeSingleMetric('fluxora_db_query_duration_seconds');
   registry.removeSingleMetric('fluxora_db_slow_queries_total');
