@@ -834,7 +834,6 @@ streamsRouter.get(
     const connectionAttempt = tryAcquireSseConnection(clientIp, sseLimits);
 
     if (!connectionAttempt.ok) {
-      sseConnectionsRejectedTotal.inc({ reason: connectionAttempt.reason });
       res.setHeader('Retry-After', String(connectionAttempt.retryAfterSeconds));
       warn('SSE connection rejected by limiter', {
         id,

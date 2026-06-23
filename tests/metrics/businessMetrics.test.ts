@@ -16,6 +16,7 @@ import {
   deRegisterBusinessMetrics,
 } from '../../src/metrics/businessMetrics.js';
 import { WebhookService } from '../../src/webhooks/service.js';
+import { DEFAULT_RETRY_POLICY } from '../../src/webhooks/types.js';
 import { IndexerIngestionService } from '../../src/indexer/service.js';
 import { InMemoryContractEventStore } from '../../src/indexer/store.js';
 import { webhookDeliveryStore } from '../../src/webhooks/store.js';
@@ -61,7 +62,7 @@ describe('Business Metrics Integration', () => {
         id: 'deliv-1',
         deliveryId: 'd1',
         eventId: 'evt-1',
-        eventType: 'stream.created',
+        eventType: 'stream.created' as const,
         endpointUrl: 'http://test-endpoint.local',
         status: 'pending' as const,
         attempts: [],
@@ -90,8 +91,9 @@ describe('Business Metrics Integration', () => {
       } as Response);
 
       const service = new WebhookService({
+        ...DEFAULT_RETRY_POLICY,
         maxAttempts: 1,
-        initialDelayMs: 1,
+        initialBackoffMs: 1,
         backoffMultiplier: 1.5,
         timeoutMs: 10,
       });
@@ -99,7 +101,7 @@ describe('Business Metrics Integration', () => {
         id: 'deliv-2',
         deliveryId: 'd2',
         eventId: 'evt-2',
-        eventType: 'stream.created',
+        eventType: 'stream.created' as const,
         endpointUrl: 'http://test-endpoint.local',
         status: 'pending' as const,
         attempts: [],
@@ -121,8 +123,9 @@ describe('Business Metrics Integration', () => {
       global.fetch = vi.fn().mockRejectedValue(new Error('Network disconnected'));
 
       const service = new WebhookService({
+        ...DEFAULT_RETRY_POLICY,
         maxAttempts: 1,
-        initialDelayMs: 1,
+        initialBackoffMs: 1,
         backoffMultiplier: 1.5,
         timeoutMs: 10,
       });
@@ -130,7 +133,7 @@ describe('Business Metrics Integration', () => {
         id: 'deliv-3',
         deliveryId: 'd3',
         eventId: 'evt-3',
-        eventType: 'stream.created',
+        eventType: 'stream.created' as const,
         endpointUrl: 'http://test-endpoint.local',
         status: 'pending' as const,
         attempts: [],
@@ -354,12 +357,25 @@ describe('Business Metrics Integration', () => {
 
   // 4. Scrape integration
   it('exposes custom business metrics in /metrics endpoint', async () => {
-    streamsCreatedTotal.inc({ status: 'active' });
+    const ADMIN_KEY = 'test-metrics-admin-key';
+    const originalKey = process.env.ADMIN_API_KEY;
+    process.env.ADMIN_API_KEY = ADMIN_KEY;
+    try {
+      streamsCreatedTotal.inc({ status: 'active' });
 
-    const res = await request(app).get('/metrics');
-    expect(res.status).toBe(200);
-    expect(res.text).toContain('fluxora_streams_created_total');
-    expect(res.text).toContain('status="active"');
+      const res = await request(app)
+        .get('/metrics')
+        .set('Authorization', `Bearer ${ADMIN_KEY}`);
+      expect(res.status).toBe(200);
+      expect(res.text).toContain('fluxora_streams_created_total');
+      expect(res.text).toContain('status="active"');
+    } finally {
+      if (originalKey !== undefined) {
+        process.env.ADMIN_API_KEY = originalKey;
+      } else {
+        delete process.env.ADMIN_API_KEY;
+      }
+    }
   });
 
   // 5. Double Registration & De-registration protection
