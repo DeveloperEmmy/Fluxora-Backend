@@ -252,6 +252,10 @@ export const EnvSchema = z.object({
   WEBHOOK_CIRCUIT_BREAKER_THRESHOLD: integerEnv('WEBHOOK_CIRCUIT_BREAKER_THRESHOLD', 0, 1000).default(0),
   WEBHOOK_CIRCUIT_BREAKER_RESET_MS: integerEnv('WEBHOOK_CIRCUIT_BREAKER_RESET_MS', 1).default(300_000),
   WEBHOOK_ALLOWED_HOSTS: optionalString('WEBHOOK_ALLOWED_HOSTS'),
+  WEBHOOK_MAX_RESPONSE_BYTES: z.preprocess(
+    byteSizeToNumber,
+    z.number().int('WEBHOOK_MAX_RESPONSE_BYTES must resolve to whole bytes').positive('WEBHOOK_MAX_RESPONSE_BYTES must be positive'),
+  ).default(64 * 1024),
 
   ENABLE_STREAM_VALIDATION: booleanEnv().default(true),
   ENABLE_RATE_LIMIT: booleanEnv().optional(),
@@ -386,7 +390,8 @@ export interface Config {
   webhookPollIntervalMs: number;
   webhookBatchSize: number;
   webhookRetryRps: number;
-  webhookAllowedHosts?: string[] | undefined;
+  webhookAllowedHosts: string[] | undefined;
+  webhookMaxResponseBytes: number;
 
   enableStreamValidation: boolean;
   enableRateLimit: boolean;
@@ -541,6 +546,7 @@ function toConfig(env: ParsedEnv): Config {
     webhookAllowedHosts: env.WEBHOOK_ALLOWED_HOSTS
       ? env.WEBHOOK_ALLOWED_HOSTS.split(',').map(h => h.trim()).filter(h => h.length > 0)
       : undefined,
+    webhookMaxResponseBytes: env.WEBHOOK_MAX_RESPONSE_BYTES,
 
     enableStreamValidation: env.ENABLE_STREAM_VALIDATION,
     enableRateLimit: env.ENABLE_RATE_LIMIT ?? !isProduction,
