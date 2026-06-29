@@ -55,6 +55,12 @@ import {
   checkAndReserve,
   untrackConnection,
 } from './connectionLimiter.js';
+import {
+  collectWsBackpressureMetrics,
+  removeWsClientBackpressureGauge,
+  DEFAULT_WS_BACKPRESSURE_INTERVAL_MS,
+  DEFAULT_WS_SLOW_CLIENT_BYTES,
+} from '../metrics/wsBackpressure.js';
 
 // ── Constants ─────────────────────────────────────────────────────────────────
 
@@ -113,6 +119,15 @@ interface ClientState {
   messageTimestamps: number[];
 }
 
+// ── Backpressure collector options ────────────────────────────────────────────
+
+export interface StreamHubBackpressureCollectorOptions {
+  /** Poll interval in milliseconds. 0 disables the periodic collector. */
+  intervalMs?: number;
+  /** Threshold above which a client is counted as "slow" in the aggregate gauge. */
+  slowThresholdBytes?: number;
+}
+
 // ── Hub options ───────────────────────────────────────────────────────────────
 
 export interface StreamHubOptions {
@@ -132,6 +147,18 @@ export interface StreamHubOptions {
    * When absent, replayFromCursor sends an empty result.
    */
   eventStore?: ContractEventStore;
+  /**
+   * Optional override for the per-client backpressure collector.
+   * - `intervalMs`: 0 disables the periodic collector entirely (operations
+   *   that drive `deliverBatch` will still update the gauge for any client
+   *   they sample).
+   * - `slowThresholdBytes`: threshold above which a client is classified as
+   *   "slow" by the aggregate gauge.
+   *
+   * Defaults: intervalMs = `DEFAULT_WS_BACKPRESSURE_INTERVAL_MS` (5s),
+   * slowThresholdBytes = `DEFAULT_WS_SLOW_CLIENT_BYTES` (1 MiB).
+   */
+  backpressureCollector?: StreamHubBackpressureCollectorOptions;
 }
 
 // ── Hub ───────────────────────────────────────────────────────────────────────
@@ -146,6 +173,8 @@ export class StreamHub extends EventEmitter {
   private readonly wsAuthRequired: boolean;
   private readonly jwtSecret: string | undefined;
   private eventStore: ContractEventStore | undefined;
+  private readonly backpressureCollectorInterval: NodeJS.Timeout | undefined;
+  private readonly backpressureSlowThresholdBytes: number;
 
   public getEventStore(): ContractEventStore | undefined {
     return this.eventStore;
@@ -177,24 +206,44 @@ export class StreamHub extends EventEmitter {
 
     this.eventStore = options?.eventStore;
 
+    // Default: 5s poll, 1 MiB slow threshold. intervalMs=0 disables the timer.
+    const collectorOpts = options?.backpressureCollector;
+    const intervalMs =
+      collectorOpts?.intervalMs ?? DEFAULT_WS_BACKPRESSURE_INTERVAL_MS;
+    this.backpressureSlowThresholdBytes =
+      collectorOpts?.slowThresholdBytes ?? DEFAULT_WS_SLOW_CLIENT_BYTES;
+
     // Use noServer mode so we fully control the upgrade handshake.
     this.wss = new WebSocketServer({ noServer: true });
+
+    // Start the backpressure collector AFTER WebSocketServer setup so the
+    // initial collection can see any clients that already connected while
+    // the server was listening.
+    this.backpressureCollectorInterval =
+      intervalMs > 0
+        ? setInterval(() => {
+            collectWsBackpressureMetrics(this, this.backpressureSlowThresholdBytes);
+          }, intervalMs)
+        : undefined;
+    if (intervalMs > 0) {
+      collectWsBackpressureMetrics(this, this.backpressureSlowThresholdBytes);
+    }
 
     // ── WebSocket upgrade handler with atomic per-IP connection limiting ─────
 
     /**
      * HTTP upgrade handler for WebSocket connections with TOCTOU-safe per-IP limiting.
-     * 
+     *
      * SECURITY CRITICAL: Per-IP connection limiting using atomic check-and-reserve.
      * This handler prevents attackers from bypassing the per-IP connection cap via
      * concurrent upgrade race conditions.
-     * 
+     *
      * ALGORITHM:
      * 1. ATOMIC CHECK-AND-RESERVE:
      *    - Call checkAndReserve(ip) which synchronously checks the limit before incrementing.
      *    - This prevents multiple concurrent requests from both passing the check.
      *    - Reservation MUST be released exactly once on any failure path.
-     * 
+     *
      * 2. PRE-UPGRADE CLEANUP HANDLER:
      *    - Install a socket 'close' listener that releases the reservation if the upgrade fails.
      *    - This covers:
@@ -202,30 +251,30 @@ export class StreamHub extends EventEmitter {
      *      * Timeouts (socket closes due to handshake timeout)
      *      * Auth failures (if WS_AUTH_REQUIRED is set)
      *    - The 'cleaned' flag ensures untrackConnection is called exactly once.
-     * 
+     *
      * 3. UPGRADE SUCCESS PATH:
      *    - Upgrade is accepted via this.wss.handleUpgrade(...)
      *    - Set 'cleaned = true' to prevent socket close listener from firing
      *    - Remove the close listener (no longer needed)
      *    - onConnect is called with the established WebSocket (reservation stays active)
-     * 
+     *
      * 4. COUNTER RELEASE ON DISCONNECT:
      *    - When the WebSocket closes (normal or abnormal), onDisconnect is called
      *    - onDisconnect calls untrackConnection(ip) to decrement the counter
-     * 
+     *
      * COUNTER LIFECYCLE:
      *   checkAndReserve(ip) ──┬─→ allowed=false  →  close socket (no release)
      *                         │
      *                         └─→ allowed=true   →  reserve slot (must release once)
      *                                                ├─→ upgrade failure  →  socket close handler  →  untrackConnection
      *                                                └─→ upgrade success  →  onConnect (owns slot)  →  onDisconnect  →  untrackConnection
-     * 
+     *
      * INVARIANTS:
      *   - Each successful checkAndReserve increments the counter (atomic)
      *   - The counter is decremented exactly once per successful reservation
      *   - Counter never goes negative (clamped to 0)
      *   - No leaks under concurrent close events
-     * 
+     *
      * @security Prevents attackers from opening more than the allowed connections via burst requests.
      * @security Counter is atomic and cannot be bypassed via race conditions.
      * @security No counter underflow or leaks on failed upgrades.
@@ -394,6 +443,9 @@ export class StreamHub extends EventEmitter {
     for (const filter of state.subscriptionFilters.values()) {
       this.removeSubscriptionFromIndexes(ws, filter);
     }
+
+    // Remove the per-client gauge time series so it doesn't accumulate.
+    removeWsClientBackpressureGauge(state.id);
 
     const durationMs = Date.now() - state.connectedAt;
     logger.info('WebSocket disconnected', state.correlationId, {
@@ -823,6 +875,16 @@ export class StreamHub extends EventEmitter {
     return this.clients.size;
   }
 
+  /**
+   * Internal entry-point used by the per-client backpressure collector to
+   * enumerate connected sockets. Underscore-prefixed because it exposes raw
+   * `WebSocket` references — callers MUST treat them as opaque and only read
+   * stable, read-only properties (e.g. `bufferedAmount`, `readyState`).
+   */
+  _getClients(): IterableIterator<[WebSocket, ClientState]> {
+    return this.clients.entries();
+  }
+
   getMetrics(): Readonly<BackpressureMetrics> {
     return { ...this.metrics };
   }
@@ -917,6 +979,9 @@ export class StreamHub extends EventEmitter {
   }
 
   async close(cb?: () => void): Promise<void> {
+    if (this.backpressureCollectorInterval) {
+      clearInterval(this.backpressureCollectorInterval);
+    }
     if (this.ownsDedup) await this.dedup.close();
     this.wss.close(cb);
   }
