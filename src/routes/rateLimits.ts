@@ -4,6 +4,7 @@ import type { RateLimiter } from '../middleware/rateLimiter.js';
 import { requireAdminAuth } from '../middleware/adminAuth.js';
 import {
   getRuntimeRateLimitConfig,
+  MAX_WINDOW_MS,
   setRuntimeRateLimitConfig,
 } from '../config/rateLimits.js';
 import type { RateLimitConfig } from '../types/rateLimit.js';
@@ -15,6 +16,9 @@ function validateConfigPatch(obj: unknown): string | null {
   if (windowMs !== undefined) {
     if (typeof windowMs !== 'number' || !Number.isInteger(windowMs) || windowMs < 1000) {
       return 'windowMs must be an integer >= 1000';
+    }
+    if (windowMs > MAX_WINDOW_MS) {
+      return `windowMs must not exceed ${MAX_WINDOW_MS} (24 hours)`;
     }
   }
   if (max !== undefined) {
