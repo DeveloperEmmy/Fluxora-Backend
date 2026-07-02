@@ -35,12 +35,14 @@ import {
 } from './middleware/requestProtection.js';
 import { apiVersionMiddleware } from './middleware/apiVersion.js';
 import { requireJsonContentType } from './middleware/contentType.js';
+import { requireJsonAccept } from './middleware/acceptNegotiation.js';
 import { httpMetrics } from './middleware/httpMetrics.js';
 import { isShuttingDown, addShutdownHook } from './shutdown.js';
 import { startRuntimeMetrics, stopRuntimeMetrics } from './metrics/runtimeMetrics.js';
 import { drainSseEventBus } from './streams/sseEmitter.js';
 import { requestStopReplay } from './indexer/service.js';
 import { quitAllRedisClients } from './redis/client.js';
+import { initializeAdminStateLock } from './state/adminState.js';
 import { createRateLimiter } from './middleware/rateLimiter.js';
 import { createDeprecationMiddleware } from './middleware/deprecation.js';
 import { routeDeprecations } from './config/deprecations.js';
@@ -176,6 +178,52 @@ async function wireWebhookCircuitBreakerStore(config: Config): Promise<void> {
   }
 }
 
+/**
+ * Initialize distributed locking for adminState pause flags.
+ *
+ * When `REDIS_ENABLED=true` (the default): wires a Redis-backed distributed lock
+ * that coordinates pause-flag writes across multiple processes.
+ * Falls back to file-based locking if Redis is unavailable.
+ *
+ * This function never rejects — all errors are caught and logged internally.
+ */
+async function wireAdminStateLock(config: Config): Promise<void> {
+  if (!config.redisEnabled) {
+    logger.info(
+      'Redis disabled — adminState will use file-based locking for pause flags',
+      undefined,
+      { component: 'admin-state-lock' },
+    );
+    return;
+  }
+
+  try {
+    const redisClient = await createRedisClient({
+      url: config.redisUrl,
+      enabled: config.redisEnabled,
+      mode: config.redisMode,
+      sentinelHosts: config.redisSentinelHosts,
+      sentinelName: config.redisSentinelName,
+      clusterNodes: config.redisClusterNodes,
+    });
+
+    initializeAdminStateLock(redisClient);
+
+    logger.info('Redis adminState lock wired', undefined, {
+      component: 'admin-state-lock',
+    });
+  } catch (err) {
+    logger.warn(
+      'Redis connection failed for adminState lock — falling back to file-based locking',
+      undefined,
+      {
+        component: 'admin-state-lock',
+        error: err instanceof Error ? err.message : String(err),
+      },
+    );
+  }
+}
+
 export function createApp(options: AppOptions = {}): Express {
   const app = express();
   const env = options.env ?? (process.env as Record<string, string | undefined>);
@@ -192,7 +240,7 @@ export function createApp(options: AppOptions = {}): Express {
   //   1. Drain SSE — close open event-stream responses with retry:0.
   //   2. Stop indexer — signal replay loop to stop at next safe batch boundary.
   //   3. Quit Redis — close all tracked Redis sockets.
-  addShutdownHook(() => drainSseEventBus());
+  addShutdownHook(() => drainSseEventBus(appConfig.sseDrainTimeoutMs));
   addShutdownHook(() => requestStopReplay());
   addShutdownHook(() => quitAllRedisClients());
 
@@ -215,6 +263,7 @@ export function createApp(options: AppOptions = {}): Express {
   const appConfig = options.config ?? loadConfig();
   void wireIdempotencyStore(appConfig);
   void wireWebhookCircuitBreakerStore(appConfig);
+  void wireAdminStateLock(appConfig);
 
   app.use(requestTimeoutMiddleware(options.requestTimeoutMs ?? appConfig.requestTimeoutMs));
   app.use(privacyHeaders);
@@ -222,6 +271,7 @@ export function createApp(options: AppOptions = {}): Express {
   app.use(createHelmetMiddleware());
   app.use(bodySizeLimitMiddleware);
   app.use('/api', requireJsonContentType);
+  app.use('/api', requireJsonAccept);
   // Correlation ID must run before express.json() so req.correlationId is available
   // even when JSON parsing throws and the error handler fires immediately.
   app.use(correlationIdMiddleware);

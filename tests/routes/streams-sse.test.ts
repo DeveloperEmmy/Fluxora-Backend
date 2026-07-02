@@ -98,6 +98,17 @@ vi.mock('../../src/ws/hub.js', async (importOriginal) => {
   };
 });
 
+// Mock auth middleware so unauthenticated requests reach the SSE handler.
+// The handler's own verifyWsToken check still enforces JWT auth for its auth tests.
+vi.mock('../../src/middleware/auth.js', async (importOriginal) => {
+  const original = await importOriginal<typeof import('../../src/middleware/auth.js')>();
+  return {
+    ...original,
+    authenticateApiKey: (_req: any, _res: any, next: any) => next(),
+    requireScope: () => (_req: any, _res: any, next: any) => next(),
+  };
+});
+
 const VALID_SENDER = 'GAAZI4TCR3TY5OJHCTJC2A4QSY6CJWJH5IAJTGKIN2ER7LBNVKOCCWN7';
 const TEST_TOKEN = generateToken({ address: VALID_SENDER, role: 'operator' });
 
@@ -181,7 +192,10 @@ describe('GET /api/streams/:id/events (SSE Endpoint)', () => {
     });
   }
 
-  function requestJson(path = '/api/streams/stream-123/events'): Promise<{
+  function requestJson(
+    path = '/api/streams/stream-123/events',
+    extraHeaders: Record<string, string> = {},
+  ): Promise<{
     status: number;
     headers: IncomingHttpHeaders;
     body: any;
@@ -192,6 +206,7 @@ describe('GET /api/streams/:id/events (SSE Endpoint)', () => {
         port,
         path,
         agent: false,
+        headers: { ...extraHeaders },
       }, (res) => {
         let body = '';
         res.on('data', (chunk) => body += chunk.toString());
@@ -807,47 +822,75 @@ describe('GET /api/streams/:id/events (SSE Endpoint)', () => {
     }
   });
 
-  it('ignores malformed Last-Event-ID (whitespace-only)', async () => {
+  it('rejects whitespace-only Last-Event-ID with 400', async () => {
     mockGetById.mockResolvedValue(makeDbRecord({ id: 'stream-123' }));
 
-    const resPromise = new Promise<string>((resolve) => {
-      const req = http.get({
-        hostname: '127.0.0.1',
-        port,
-        path: '/api/streams/stream-123/events',
-        headers: { 'Last-Event-ID': '   ' },
-      }, (res) => {
-        let data = '';
-        res.on('data', (chunk) => {
-          data += chunk.toString();
-          if (data.includes(': ok\n\n')) {
-            req.destroy();
-            resolve(data);
-          }
-        });
-      });
-      req.on('error', () => resolve(''));
+    const res = await requestJson('/api/streams/stream-123/events', {
+      'Last-Event-ID': '   ',
     });
 
-    await resPromise;
-    // Malformed ID should not trigger any getEvents call
+    expect(res.status).toBe(400);
+    expect(res.body.success).toBe(false);
+    expect(res.body.error.code).toBe('VALIDATION_ERROR');
     expect(mockGetEvents).not.toHaveBeenCalled();
   });
 
-  it('ignores Last-Event-ID longer than 200 characters', async () => {
+  it('rejects Last-Event-ID longer than 200 characters with 400', async () => {
     mockGetById.mockResolvedValue(makeDbRecord({ id: 'stream-123' }));
+
+    const res = await requestJson('/api/streams/stream-123/events', {
+      'Last-Event-ID': 'a'.repeat(201),
+    });
+
+    expect(res.status).toBe(400);
+    expect(res.body.success).toBe(false);
+    expect(res.body.error.code).toBe('VALIDATION_ERROR');
+    expect(mockGetEvents).not.toHaveBeenCalled();
+  });
+
+  it('rejects Last-Event-ID containing space (0x20) with 400', async () => {
+    mockGetById.mockResolvedValue(makeDbRecord({ id: 'stream-123' }));
+
+    const res = await requestJson('/api/streams/stream-123/events', {
+      'Last-Event-ID': 'evt 1',
+    });
+
+    expect(res.status).toBe(400);
+    expect(res.body.success).toBe(false);
+    expect(res.body.error.code).toBe('VALIDATION_ERROR');
+    expect(mockGetEvents).not.toHaveBeenCalled();
+  });
+
+  it('accepts a valid printable Last-Event-ID and triggers replay', async () => {
+    mockGetById.mockResolvedValue(makeDbRecord({ id: 'stream-123' }));
+    mockGetEvents.mockResolvedValue({
+      events: [{
+        eventId: 'evt-100',
+        ledger: 100,
+        ledgerHash: 'hash-100',
+        contractId: 'contract-abc',
+        topic: 'stream.created',
+        txHash: 'tx-100',
+        eventIndex: 0,
+        payload: { id: 'stream-123', depositAmount: '500' },
+        happenedAt: '2026-01-01T00:00:00.000Z',
+      }],
+      total: 1,
+      limit: 100,
+      offset: 0,
+    });
 
     const resPromise = new Promise<string>((resolve) => {
       const req = http.get({
         hostname: '127.0.0.1',
         port,
         path: '/api/streams/stream-123/events',
-        headers: { 'Last-Event-ID': 'a'.repeat(201) },
+        headers: { 'Last-Event-ID': 'evt-99' },
       }, (res) => {
         let data = '';
         res.on('data', (chunk) => {
           data += chunk.toString();
-          if (data.includes(': ok\n\n')) {
+          if (data.includes(': ok\n\n') && data.includes('evt-100')) {
             req.destroy();
             resolve(data);
           }
@@ -856,8 +899,13 @@ describe('GET /api/streams/:id/events (SSE Endpoint)', () => {
       req.on('error', () => resolve(''));
     });
 
-    await resPromise;
-    expect(mockGetEvents).not.toHaveBeenCalled();
+    const output = await resPromise;
+    expect(output).toContain('id: evt-100');
+    expect(output).toContain('event: stream_update');
+    expect(mockGetEvents).toHaveBeenCalledWith({
+      afterEventId: 'evt-99',
+      limit: 100,
+    });
   });
 });
 
@@ -915,5 +963,63 @@ describe('eventMatchesStreamId', () => {
   it('returns false for falsy inputs', () => {
     expect(eventMatchesStreamId(null as unknown as StreamEventRecord, 'stream-abc123-0')).toBe(false);
     expect(eventMatchesStreamId(makeEventRecord(), '')).toBe(false);
+  });
+});
+
+// ── Unit tests for Last-Event-ID validation ─────────────────────────────────
+
+import { parseLastEventIdHeader } from '../../src/routes/streams.js';
+
+describe('parseLastEventIdHeader', () => {
+  it('returns undefined when header is absent', () => {
+    expect(parseLastEventIdHeader(undefined)).toBeUndefined();
+  });
+
+  it('returns the trimmed value for a valid printable ID', () => {
+    expect(parseLastEventIdHeader('evt-99')).toBe('evt-99');
+  });
+
+  it('accepts IDs containing any printable ASCII 0x21-0x7E', () => {
+    expect(parseLastEventIdHeader('abc123!@#$-_.+:?=')).toBe('abc123!@#$-_.+:?=');
+  });
+
+  it('rejects empty string', () => {
+    expect(() => parseLastEventIdHeader('')).toThrow('Last-Event-ID must not be empty');
+  });
+
+  it('rejects whitespace-only value', () => {
+    expect(() => parseLastEventIdHeader('   ')).toThrow('Last-Event-ID must not be empty');
+  });
+
+  it('rejects value containing CR (\\r)', () => {
+    expect(() => parseLastEventIdHeader('evt-1\r')).toThrow('Last-Event-ID contains invalid characters');
+  });
+
+  it('rejects value containing LF (\\n)', () => {
+    expect(() => parseLastEventIdHeader('evt-1\n')).toThrow('Last-Event-ID contains invalid characters');
+  });
+
+  it('rejects value containing CRLF (\\r\\n)', () => {
+    expect(() => parseLastEventIdHeader('evt-1\r\n')).toThrow('Last-Event-ID contains invalid characters');
+  });
+
+  it('rejects value containing NUL byte', () => {
+    expect(() => parseLastEventIdHeader('evt-1\0')).toThrow('Last-Event-ID contains invalid characters');
+  });
+
+  it('rejects value containing space (0x20)', () => {
+    expect(() => parseLastEventIdHeader('evt 1')).toThrow('Last-Event-ID contains invalid characters');
+  });
+
+  it('rejects value longer than 200 characters', () => {
+    expect(() => parseLastEventIdHeader('a'.repeat(201))).toThrow('Last-Event-ID contains invalid characters');
+  });
+
+  it('accepts value exactly 200 characters', () => {
+    expect(parseLastEventIdHeader('a'.repeat(200))).toBe('a'.repeat(200));
+  });
+
+  it('rejects non-string type', () => {
+    expect(() => parseLastEventIdHeader(['multi'] as unknown as string)).toThrow('Last-Event-ID must be a string');
   });
 });

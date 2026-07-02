@@ -106,6 +106,39 @@ import {
 } from '../redis/idempotencyStore.js';
 export const streamsRouter = Router();
 
+/**
+ * Validate and sanitise the Last-Event-ID header value.
+ *
+ * Security: rejects control characters (CR/LF/NUL), whitespace-only values,
+ * and values exceeding 200 characters. The allowed character set is printable
+ * ASCII 0x21–0x7E which excludes space (0x20) and all control characters.
+ *
+ * Returns the trimmed, validated value or throws a validationError.
+ * Returns `undefined` when the header is absent (no replay requested).
+ *
+ * Exported for unit testing — the HTTP parser strips control characters from
+ * headers in transit, so integration tests cannot cover CR/LF/NUL paths.
+ */
+export function parseLastEventIdHeader(raw: unknown): string | undefined {
+  if (raw === undefined) return undefined;
+  if (typeof raw !== 'string') {
+    throw validationError('Last-Event-ID must be a string');
+  }
+  // Validate the raw value BEFORE trimming so control characters in the value
+  // (CR, LF, NUL, etc.) are caught — trim() would strip trailing CR/LF.
+  if (raw.trim() === '') {
+    throw validationError('Last-Event-ID must not be empty or whitespace-only');
+  }
+  if (!/^[\x21-\x7E]+$/.test(raw)) {
+    throw validationError('Last-Event-ID contains invalid characters or exceeds the 200-character limit');
+  }
+  const trimmed = raw.trim();
+  if (trimmed.length > 200) {
+    throw validationError('Last-Event-ID contains invalid characters or exceeds the 200-character limit');
+  }
+  return trimmed;
+}
+
 // ── Types ─────────────────────────────────────────────────────────────────────
 
 /** Public-facing stream shape (camelCase, decimal strings). */
@@ -230,6 +263,31 @@ function setStreamResourceHeaders(
 ): void {
   res.set('ETag', streamEntityTag(metadata));
   res.set('Last-Modified', new Date(metadata.updated_at).toUTCString());
+}
+
+/**
+ * RFC 7232 §3.2 weak comparison for If-None-Match.
+ *
+ * The `*` wildcard matches any current representation.
+ * Otherwise the field value is a comma-separated list of entity-tags and the
+ * recipient uses the weak comparison function (strip `W/` prefix before
+ * character-for-character comparison of the opaque-tag, including DQUOTES).
+ *
+ * @param ifNoneMatch - raw value of the If-None-Match request header
+ * @param etag - the server-computed ETag for the current representation
+ * @returns `true` when any entry in the list matches
+ */
+function matchesIfNoneMatch(ifNoneMatch: string, etag: string): boolean {
+  const trimmed = ifNoneMatch.trim();
+  if (trimmed === '*') return true;
+
+  const normalize = (tag: string): string => tag.replace(/^W\//i, '');
+  const normalizedEtag = normalize(etag);
+
+  return trimmed
+    .split(',')
+    .map((t) => normalize(t.trim()))
+    .some((t) => t === normalizedEtag);
 }
 
 // ── Cursor helpers ────────────────────────────────────────────────────────────
@@ -547,6 +605,22 @@ streamsRouter.get(
     }
 
     if (!record) throw notFound('Stream', id);
+
+    // Conditional GET (RFC 7232 §3.2)
+    const etag = streamEntityTag(record!);
+    const rawIfNoneMatch = req.headers['if-none-match'];
+    if (rawIfNoneMatch !== undefined) {
+      const header = Array.isArray(rawIfNoneMatch)
+        ? rawIfNoneMatch.join(', ')
+        : rawIfNoneMatch;
+      if (matchesIfNoneMatch(header, etag)) {
+        res.set('ETag', etag);
+        res.set('Last-Modified', new Date(record!.updated_at).toUTCString());
+        res.status(304).end();
+        return;
+      }
+    }
+
     const stream = toApiStream(record!);
     setStreamResourceHeaders(res, record!);
     res.set(
@@ -974,8 +1048,19 @@ streamsRouter.get(
       throw notFound('Stream', id);
     }
 
+    // 4. Validate Last-Event-ID before establishing the SSE stream so that
+    // invalid values produce a standard JSON 400 response (not SSE framing).
+    const rawLastEventId = req.headers['last-event-id'];
+    let lastEventId: string | undefined;
     try {
-      // 4. Establish Server-Sent Events stream.
+      lastEventId = parseLastEventIdHeader(rawLastEventId);
+    } catch (err) {
+      cleanup('validation_error');
+      throw err;
+    }
+
+    try {
+      // 5. Establish Server-Sent Events stream.
       res.setHeader('Content-Type', 'text/event-stream');
       res.setHeader('Cache-Control', 'no-cache, no-transform');
       res.setHeader('Connection', 'keep-alive');
@@ -1013,16 +1098,9 @@ streamsRouter.get(
     }, sseLimits.maxConnectionDurationMs);
     maxDurationTimer.unref?.();
 
-    // 5. Handle Last-Event-ID Resumption Replay.
-    // Security: validate the header value to prevent unbounded replay or injection.
-    // A valid event ID is 1–200 printable non-whitespace characters.
-    const rawLastEventId = req.headers['last-event-id'];
-    const lastEventId =
-      typeof rawLastEventId === 'string' &&
-      /^[\x21-\x7E]{1,200}$/.test(rawLastEventId.trim())
-        ? rawLastEventId.trim()
-        : undefined;
-
+    // 6. Handle Last-Event-ID Resumption Replay.
+    // At this point the header has already been validated; replay runs inside
+    // the SSE connection so we can stream historical events before live updates.
     if (lastEventId) {
       const hub = getStreamHub();
       const eventStore = hub?.getEventStore();
@@ -1109,17 +1187,30 @@ streamsRouter.get(
 
     // Register a shutdown drain callback so drainSseEventBus() can close this
     // response cleanly with a retry:0 directive instead of an abrupt socket close.
-    const deregisterShutdown = registerSseShutdownCallback(() => {
-      try {
-        if (!res.writableEnded && !res.destroyed) {
-          res.write('retry: 0\n\n');
-          res.end();
+    // A forceClose callback is also registered so that when the per-connection
+    // drain timeout is exceeded the underlying socket is destroyed immediately.
+    const deregisterShutdown = registerSseShutdownCallback(
+      async () => {
+        try {
+          if (!res.writableEnded && !res.destroyed) {
+            res.write('retry: 0\n\n');
+            res.end();
+          }
+        } catch {
+          // Best-effort — the socket may already be gone.
         }
-      } catch {
-        // Best-effort — the socket may already be gone.
-      }
-      cleanup('shutdown_drain');
-    });
+        cleanup('shutdown_drain');
+      },
+      () => {
+        try {
+          if (!res.destroyed) {
+            res.destroy();
+          }
+        } catch {
+          // Best-effort — the socket may already be gone.
+        }
+      },
+    );
     const origUnsubscribe = unsubscribeLiveUpdates;
     unsubscribeLiveUpdates = () => {
       origUnsubscribe();

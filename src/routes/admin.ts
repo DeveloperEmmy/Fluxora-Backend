@@ -1,5 +1,6 @@
 import { Router } from 'express';
 import { requireAdminAuth } from '../middleware/adminAuth.js';
+import { getHybridBanStoreStatus } from '../redis/banStore.js';
 import {
   getPauseFlags,
   setPauseFlags,
@@ -12,6 +13,7 @@ import { recordAuditEvent, recordAuditEventToDb } from '../lib/auditLog.js';
 import { getStreamHub } from '../ws/hub.js';
 import { successResponse, errorResponse } from '../utils/response.js';
 import { clearIndexerStall, ActiveStallError } from '../indexer/stall.js';
+import { routeDeprecations } from '../config/deprecations.js';
 
 export const adminRouter = Router();
 
@@ -27,6 +29,29 @@ adminRouter.get('/status/read-only', (_req, res) => {
 
 // Every admin route requires a valid Bearer token.
 adminRouter.use(requireAdminAuth);
+
+/**
+ * GET /api/admin/deprecations
+ * Returns all registered deprecated routes with their sunset dates and
+ * computed daysUntilSunset, enabling SRE tooling to alert before removal.
+ *
+ * @security Requires valid Bearer admin token.
+ * @returns Array of deprecated route entries, each with `route`, `sunsetDate`,
+ *          optional `link`, and computed `daysUntilSunset` (negative if past sunset).
+ */
+adminRouter.get('/deprecations', (req, res) => {
+  const requestId = req.id ?? req.correlationId;
+  const now = Date.now();
+  const MS_PER_DAY = 86_400_000;
+
+  const deprecations = routeDeprecations.map(({ route, sunsetDate, link }) => {
+    const sunsetMs = new Date(sunsetDate).getTime();
+    const daysUntilSunset = Math.floor((sunsetMs - now) / MS_PER_DAY);
+    return { route, sunsetDate, ...(link !== undefined ? { link } : {}), daysUntilSunset };
+  });
+
+  res.json(successResponse(deprecations, requestId));
+});
 
 /**
  * GET /api/admin/status
@@ -62,7 +87,7 @@ adminRouter.get('/pause', (_req, res) => {
  * Body (all fields optional):
  *   { "streamCreation": true, "ingestion": false }
  */
-adminRouter.put('/pause', (req, res) => {
+adminRouter.put('/pause', async (req, res) => {
   const requestId = req.id ?? req.correlationId;
   const { streamCreation, ingestion } = req.body ?? {};
 
@@ -100,7 +125,7 @@ adminRouter.put('/pause', (req, res) => {
   const previous = getPauseFlags();
   let updated;
   try {
-    updated = setPauseFlags({ streamCreation, ingestion });
+    updated = await setPauseFlags({ streamCreation, ingestion });
   } catch (err) {
     if (err instanceof AdminStatePersistenceError) {
       res.status(503).json(
@@ -312,7 +337,7 @@ adminRouter.post('/api-keys', async (req, res) => {
     return;
   }
   try {
-    const created = await createApiKey(name, req.correlationId);
+    const created = await createApiKey(name, undefined, req.correlationId);
     res.status(201).json(successResponse(created, requestId));
   } catch (err) {
     res.status(400).json(
@@ -358,5 +383,20 @@ adminRouter.delete('/api-keys/:id', async (req, res) => {
     const status = msg.includes('not found') ? 404 : 400;
     const code = status === 404 ? 'NOT_FOUND' : 'API_KEY_ERROR';
     res.status(status).json(errorResponse(code, msg, undefined, requestId));
+  }
+});
+
+/**
+ * GET /api/admin/ban-store/status
+ * Returns the health and fallback state of the HybridBanStore.
+ */
+adminRouter.get('/ban-store/status', (_req, res) => {
+  try {
+    const status = typeof getHybridBanStoreStatus === 'function'
+      ? getHybridBanStoreStatus()
+      : { available: false, reason: 'getHybridBanStoreStatus not implemented' };
+    res.json({ ok: true, banStore: status });
+  } catch (err) {
+    res.status(503).json({ ok: false, error: err instanceof Error ? err.message : String(err) });
   }
 });

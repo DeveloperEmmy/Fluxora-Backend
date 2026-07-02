@@ -703,13 +703,48 @@ registry.registerPath({
   method: 'get',
   path: '/api/streams/{id}',
   summary: 'Get stream by ID',
+  description:
+    'Returns a single stream record. Supports conditional GET via the ' +
+    '`If-None-Match` request header (RFC 7232 §3.2). ' +
+    'When the ETag matches, a 304 Not Modified response is returned ' +
+    'with no body, indicating the client\'s cached representation is still fresh. ' +
+    'The server emits a weak ETag (`W/"…"`) derived from the stream id and ' +
+    '`updated_at` timestamp.',
   tags: ['streams'],
-  request: { params: z.object({ id: z.string().openapi({ example: 'stream-abc123' }) }) },
+  request: {
+    params: z.object({ id: z.string().openapi({ example: 'stream-abc123' }) }),
+    headers: z.object({
+      'If-None-Match': z.string().optional().openapi({
+        description:
+          'Conditional request header (RFC 7232 §3.2). ' +
+          'Accepts `*`, a single entity-tag, or a comma-separated list of ' +
+          'entity-tags. Weak comparison is used per the spec.',
+        example: 'W/"abc123..."',
+      }),
+    }),
+  },
   responses: {
     '200': {
       description: 'Stream record',
       content: {
         'application/json': { schema: successSchema(z.object({ stream: StreamObject })) },
+      },
+    },
+    '304': {
+      description:
+        'Not Modified — the ETag matches the `If-None-Match` value. ' +
+        'Body is empty. The response includes the same `ETag` and `Last-Modified` ' +
+        'headers that would accompany a 200 response.',
+      headers: {
+        ...commonResponseHeaders,
+        'ETag': {
+          description: 'Weak entity-tag of the unchanged representation.',
+          schema: { type: 'string', example: 'W/"abc123..."' },
+        },
+        'Last-Modified': {
+          description: 'Last modification timestamp of the stream.',
+          schema: { type: 'string', format: 'http-date', example: 'Thu, 01 Jan 2026 00:00:00 GMT' },
+        },
       },
     },
     '404': errorResponses['404'],
@@ -905,15 +940,77 @@ registry.registerPath({
 
 // ── Privacy ───────────────────────────────────────────────────────────────────
 
+/**
+ * TrustBoundary schema — describes what each actor class may and may not do.
+ * Consumed by the GET /api/privacy/policy endpoint and referenced in
+ * authorization middleware for automated compliance checks.
+ */
+const TrustBoundarySchema = registry.register(
+  'TrustBoundary',
+  z
+    .object({
+      actor: z.string().openapi({
+        example: 'Anonymous client',
+        description: 'The actor class this boundary applies to.',
+      }),
+      description: z.string().openapi({
+        example: 'Unauthenticated public internet request.',
+        description: 'Human-readable description of the actor class.',
+      }),
+      allowed: z.array(z.string()).openapi({
+        example: ['Read public stream list and individual stream details'],
+        description: 'Operations this actor class is permitted to perform.',
+      }),
+      denied: z.array(z.string()).openapi({
+        example: ['Create or mutate stream records (future: requires auth)'],
+        description: 'Operations explicitly denied to this actor class.',
+      }),
+    })
+    .openapi({
+      description:
+        'Defines access boundaries for a specific actor class. ' +
+        'The denied array must not reference internal bypass mechanisms or undocumented admin paths.',
+    })
+);
+
+const PrivacyPolicyResponseSchema = z.object({
+  service: z.string().openapi({ example: 'fluxora-backend' }),
+  version: z.string().openapi({ example: '0.1.0' }),
+  piiPolicy: z.object({
+    summary: z.string(),
+    dataClassifications: z.array(
+      z.object({
+        level: z.string().openapi({ example: 'PUBLIC' }),
+        description: z.string(),
+      })
+    ),
+    fieldPolicies: z.object({
+      streamFields: z.record(z.string(), z.unknown()),
+      requestFields: z.record(z.string(), z.unknown()),
+    }),
+    retentionSchedule: z.array(z.record(z.string(), z.unknown())),
+    trustBoundaries: z.array(TrustBoundarySchema).openapi({
+      description:
+        'Trust boundary definitions for all actor classes. ' +
+        'Enables automated compliance checks to verify the declared access model.',
+    }),
+  }),
+  _links: z.record(z.string(), z.string()),
+});
+
 registry.registerPath({
   method: 'get',
   path: '/api/privacy/policy',
   summary: 'PII policy document',
+  description:
+    'Returns the full PII policy document including field classifications, ' +
+    'retention schedule, and trust boundaries for all actor classes. ' +
+    'Suitable for machine-readable compliance audits and data-controller integrations.',
   tags: ['privacy'],
   responses: {
     '200': {
-      description: 'Full PII policy',
-      content: { 'application/json': { schema: z.record(z.string(), z.unknown()) } },
+      description: 'Full PII policy including trustBoundaries array',
+      content: { 'application/json': { schema: PrivacyPolicyResponseSchema } },
     },
   },
 });
@@ -1174,6 +1271,43 @@ registry.registerPath({
     '204': { description: 'Key revoked' },
     '401': errorResponses['401'],
     '404': errorResponses['404'],
+  },
+});
+
+// ── Deprecations ─────────────────────────────────────────────────────────────
+
+const DeprecatedRouteEntry = registry.register(
+  'DeprecatedRouteEntry',
+  z.object({
+    route: z.string().openapi({ example: '/api/rate-limits/config', description: 'Deprecated route path' }),
+    sunsetDate: z.string().openapi({ example: '2026-09-30T00:00:00.000Z', description: 'ISO-8601 planned removal date' }),
+    link: z.string().optional().openapi({ example: '/docs/api/deprecation-policy.md#current-deprecations', description: 'Migration or policy documentation URL' }),
+    daysUntilSunset: z.number().int().openapi({ example: 93, description: 'Days until sunset; negative if already past sunset date' }),
+  }).openapi({ description: 'A deprecated route entry with sunset metadata' })
+);
+
+registry.registerPath({
+  method: 'get',
+  path: '/api/admin/deprecations',
+  summary: 'List deprecated routes',
+  description: 'Returns all registered deprecated routes with their sunset dates and computed daysUntilSunset. Past-sunset entries have negative daysUntilSunset.',
+  tags: ['admin'],
+  security: [{ bearerAuth: [] }],
+  responses: {
+    '200': {
+      description: 'Deprecations list',
+      content: {
+        'application/json': {
+          schema: z.object({
+            success: z.literal(true),
+            data: z.array(DeprecatedRouteEntry),
+            meta: z.object({ timestamp: z.string() }),
+          }),
+        },
+      },
+    },
+    '401': errorResponses['401'],
+    '403': errorResponses['403'],
   },
 });
 
@@ -1695,17 +1829,32 @@ registry.registerPath({
         'application/json': {
           schema: z.object({
             ok: z.literal(true),
-            deliveryId: z.string(),
-            eventType: z.string().nullable(),
-            event: z.unknown(),
+            deliveryId: z.string().openapi({ example: 'del_01HXYZ', description: 'Echoed delivery ID' }),
+            eventType: z.string().nullable().openapi({ example: 'stream.created' }),
+            event: z.record(z.string(), z.unknown()).nullable().openapi({ description: 'Parsed event payload' }),
           }),
         },
       },
     },
     '400': errorResponses['400'],
-    '401': errorResponses['401'],
+    '401': {
+      description: 'Invalid signature or missing required headers',
+      content: { 'application/json': { schema: ErrorEnvelope } },
+    },
+    '409': {
+      description: 'Duplicate delivery — already processed this delivery ID',
+      content: {
+        'application/json': {
+          schema: z.object({
+            error: z.literal('duplicate_delivery'),
+            message: z.string(),
+            deliveryId: z.string(),
+          }),
+        },
+      },
+    },
     '413': {
-      description: 'Payload too large',
+      description: 'Payload too large (> 1 MB)',
       content: { 'application/json': { schema: ErrorEnvelope } },
     },
   },

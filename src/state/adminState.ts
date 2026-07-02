@@ -3,11 +3,17 @@
  *
  * Holds pause flags and reindex tracking in memory, with file-backed
  * persistence for pause flags so admin toggles survive process restarts.
+ *
+ * Pause-flag writes are protected by a distributed lock (Redis-backed with file lock fallback)
+ * to ensure safe concurrent writes across multiple processes.
  */
 
 import * as fs from 'node:fs';
-import { dirname } from 'node:path';
+import { dirname, join } from 'node:path';
+import type { RedisClient } from '../redis/client.js';
+import { RedisDistributedLock, NoOpLock, Lock } from './adminStateLock.js';
 import { logger } from '../lib/logger.js';
+import { adminReindexJobDurationSeconds } from '../metrics/businessMetrics.js';
 
 export interface PauseFlags {
   /** Block new stream creation via the public API. */
@@ -51,6 +57,8 @@ const state: AdminState = {
     processedItems: 0,
   },
 };
+
+let pauseFlagsLock: Lock | null = null;
 
 hydratePauseFlagsFromPersistence();
 
@@ -108,32 +116,37 @@ function readPersistedPauseFlags(): PauseFlags | null {
   }
 }
 
-function writePersistedPauseFlags(flags: PauseFlags): void {
-  const adminStatePath = resolveAdminStatePath();
-  const tempPath = `${adminStatePath}.${process.pid}.tmp`;
-  const payload: PersistedAdminStateV1 = {
-    version: 1,
-    pauseFlags: {
-      streamCreation: flags.streamCreation,
-      ingestion: flags.ingestion,
-    },
-  };
-
-  fs.mkdirSync(dirname(adminStatePath), { recursive: true, mode: 0o700 });
+async function writePersistedPauseFlags(flags: PauseFlags): Promise<void> {
+  const lock = await acquirePauseFlagsLock();
   try {
-    fs.writeFileSync(tempPath, `${JSON.stringify(payload, null, 2)}\n`, {
-      encoding: 'utf8',
-      mode: 0o600,
-    });
-    fs.renameSync(tempPath, adminStatePath);
-  } catch (err) {
-    // Best effort cleanup for failed atomic writes.
+    const adminStatePath = resolveAdminStatePath();
+    const tempPath = `${adminStatePath}.${process.pid}.tmp`;
+    const payload: PersistedAdminStateV1 = {
+      version: 1,
+      pauseFlags: {
+        streamCreation: flags.streamCreation,
+        ingestion: flags.ingestion,
+      },
+    };
+
+    fs.mkdirSync(dirname(adminStatePath), { recursive: true, mode: 0o700 });
     try {
-      fs.rmSync(tempPath, { force: true });
-    } catch {
-      // no-op
+      fs.writeFileSync(tempPath, `${JSON.stringify(payload, null, 2)}\n`, {
+        encoding: 'utf8',
+        mode: 0o600,
+      });
+      fs.renameSync(tempPath, adminStatePath);
+    } catch (err) {
+      // Best effort cleanup for failed atomic writes.
+      try {
+        fs.rmSync(tempPath, { force: true });
+      } catch {
+        // no-op
+      }
+      throw err;
     }
-    throw err;
+  } finally {
+    await lock.release();
   }
 }
 
@@ -143,11 +156,31 @@ function hydratePauseFlagsFromPersistence(): void {
   state.pauseFlags = persisted;
 }
 
+/**
+ * Initialize distributed locking for pause flags with a Redis client.
+ * Call this during app startup after Redis is available.
+ * If not called, file-based locking will be used as fallback.
+ */
+export function initializeAdminStateLock(redis: RedisClient): void {
+  pauseFlagsLock = new RedisDistributedLock(redis, 'pauseFlags');
+}
+
+async function acquirePauseFlagsLock(): Promise<Lock> {
+  if (!pauseFlagsLock) {
+    pauseFlagsLock = new RedisDistributedLock(
+      // Create a minimal Redis-compatible interface that falls back to file locking
+      { setNx: async () => false, del: async () => {} } as RedisClient,
+      'pauseFlags',
+    );
+  }
+  return pauseFlagsLock.acquire();
+}
+
 export function getPauseFlags(): PauseFlags {
   return { ...state.pauseFlags };
 }
 
-export function setPauseFlags(flags: Partial<PauseFlags>): PauseFlags {
+export async function setPauseFlags(flags: Partial<PauseFlags>): Promise<PauseFlags> {
   const next: PauseFlags = {
     streamCreation:
       flags.streamCreation !== undefined ? flags.streamCreation : state.pauseFlags.streamCreation,
@@ -162,7 +195,7 @@ export function setPauseFlags(flags: Partial<PauseFlags>): PauseFlags {
   }
 
   try {
-    writePersistedPauseFlags(next);
+    await writePersistedPauseFlags(next);
   } catch (err) {
     throw new AdminStatePersistenceError('Failed to persist admin pause flags', err);
   }
@@ -206,6 +239,7 @@ export async function triggerReindex(): Promise<ReindexState> {
 }
 
 async function runReindexJob(): Promise<void> {
+  const endTimer = adminReindexJobDurationSeconds.startTimer();
   try {
     // Simulate incremental reindex work (placeholder for Horizon replay).
     const steps = 5;
@@ -215,10 +249,12 @@ async function runReindexJob(): Promise<void> {
     }
     state.reindex.status = 'completed';
     state.reindex.completedAt = new Date().toISOString();
+    endTimer({ outcome: 'success' });
   } catch (err) {
     state.reindex.status = 'failed';
     state.reindex.completedAt = new Date().toISOString();
     state.reindex.error = err instanceof Error ? err.message : String(err);
+    endTimer({ outcome: 'failure' });
   }
 }
 
@@ -257,4 +293,38 @@ export function _reloadPauseFlagsFromPersistenceForTest(): void {
     return;
   }
   state.pauseFlags = persisted;
+}
+
+/**
+ * Checks whether the configured `ADMIN_STATE_FILE` path is writable at startup.
+ *
+ * Performs a write-and-delete probe using a `.probe` sentinel file in the same
+ * directory as the admin state file. If the probe fails (e.g. read-only
+ * container filesystem), a structured warning is emitted but the server
+ * continues to start — in-memory pause flags remain fully functional without
+ * persistence.
+ *
+ * Security: the probe file path is derived solely from the server-controlled
+ * environment variable and is not logged in the warning to avoid leaking
+ * internal directory structure in security-sensitive deployments.
+ *
+ * @returns A promise that resolves to `true` if the path is writable, or
+ *   `false` if the write probe failed.
+ */
+export async function checkAdminStatePersistence(): Promise<boolean> {
+  const adminStatePath = resolveAdminStatePath();
+  const dir = dirname(adminStatePath);
+  const probePath = join(dir, '.fluxora-admin-state.probe');
+
+  try {
+    fs.mkdirSync(dir, { recursive: true, mode: 0o700 });
+    fs.writeFileSync(probePath, '', { encoding: 'utf8', mode: 0o600 });
+    fs.rmSync(probePath, { force: true });
+    return true;
+  } catch {
+    logger.warn('Admin state file path is not writable; pause flags will not persist across restarts', undefined, {
+      event: 'admin_state_file_not_writable',
+    });
+    return false;
+  }
 }
