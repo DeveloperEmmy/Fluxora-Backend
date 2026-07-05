@@ -43,6 +43,58 @@ function write(level: LogLevel, message: string, correlationId?: string, meta?: 
   }
 }
 
+/**
+ * Backward-compatible functional API.
+ *
+ * Several modules (auth middleware, stream routes, repositories, the
+ * indexer service, etc.) still import standalone `debug`/`info`/`warn`/
+ * `error`/`SerializationLogger` from the logger module using the
+ * pre-consolidation signature `(message, context)` rather than the
+ * `logger.<level>(message, correlationId?, meta?)` object API above. These
+ * shims restore that surface — routed through the same sanitizing `write()`
+ * — so existing call sites keep working without each needing to be touched.
+ */
+export interface LogContext {
+  correlationId?: string;
+  [key: string]: unknown;
+}
+
+function splitContext(context: LogContext = {}): { correlationId?: string; meta?: Record<string, unknown> } {
+  const { correlationId, ...meta } = context;
+  return { correlationId, meta };
+}
+
+export function info(message: string, context: LogContext = {}): void {
+  const { correlationId, meta } = splitContext(context);
+  write('info', message, correlationId, meta);
+}
+
+export function warn(message: string, context: LogContext = {}): void {
+  const { correlationId, meta } = splitContext(context);
+  write('warn', message, correlationId, meta);
+}
+
+export function error(message: string, context: LogContext = {}, err?: Error): void {
+  const { correlationId, meta } = splitContext(context);
+  write('error', message, correlationId, { ...meta, ...(err ? { error: err.message, stack: err.stack } : {}) });
+}
+
+export function debug(message: string, context: LogContext = {}): void {
+  if (process.env.LOG_LEVEL === 'debug') {
+    const { correlationId, meta } = splitContext(context);
+    write('debug', message, correlationId, meta);
+  }
+}
+
+export const SerializationLogger = {
+  validationFailed: (field: string, raw: unknown, code: string, requestId?: string): void => {
+    warn(`Decimal validation failed: ${field}`, { field, raw, code, requestId });
+  },
+  amountSerialized: (count: number, requestId?: string): void => {
+    debug(`Amounts serialized: ${count}`, { requestId });
+  },
+};
+
 export const logger = {
   debug(message: string, correlationId?: string, meta?: Record<string, unknown>): void {
     write('debug', message, correlationId, meta);
